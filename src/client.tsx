@@ -60,6 +60,17 @@ type Tenant = {
   name: string;
   icon: string;
   description: string;
+  dynamic?: boolean;
+};
+
+type DynamicAgent = {
+  agent_id: string;
+  name: string;
+  icon: string;
+  description: string;
+  model: string;
+  enable_sandbox: number;
+  created_at: string;
 };
 
 type ConnectionStatus = "connecting" | "connected" | "disconnected";

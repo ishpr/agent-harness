@@ -50,9 +50,9 @@
     "enabled": true
   },
 
-  // Access code for login protection + optional API keys for outbound Workers
+  // Access code for login protection — set via: wrangler secret put ACCESS_CODE
+  // Optional API keys for outbound Workers — also set as secrets
   "vars": {
-    "ACCESS_CODE": "021Agents-ai",
     "SANDBOX_TRANSPORT": "websocket"
   }
 }

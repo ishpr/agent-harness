@@ -770,13 +770,14 @@ export class ChatAgent extends AIChatAgent<Env> {
 
 // ── AgentSupervisor DO ────────────────────────────────────────────────────────
 //
-// Manages dynamically created agents as Durable Object Facets.
-// Each agent is loaded from code stored in the supervisor's own KV/SQLite and
-// run as an isolated facet with its own SQLite state.
+// Manages dynamically created agents. The supervisor handles LLM chat directly
+// using Workers AI + tools — no dynamic worker code generation needed.
+// Chat history is stored per-agent in the supervisor's own KV storage.
 //
-// Requires in wrangler.jsonc:
-//   "worker_loaders": [{ "binding": "LOADER" }]
-//   "durable_objects": { "bindings": [..., { "name": "AgentSupervisor", "class_name": "AgentSupervisor" }] }
+// This avoids the complexity of making full AIChatAgent work inside dynamic
+// workers (which don't have access to env bindings like AI, MYBROWSER, etc.).
+
+type StoredMessage = { role: "user" | "assistant"; content: string };
 
 export class AgentSupervisor extends DurableObject<Env> {
   /**
@@ -794,7 +795,6 @@ export class AgentSupervisor extends DurableObject<Env> {
           system_prompt TEXT NOT NULL,
           model       TEXT DEFAULT '@cf/moonshotai/kimi-k2.5',
           enable_sandbox INTEGER DEFAULT 0,
-          code_id     TEXT,
           created_at  TEXT DEFAULT (datetime('now')),
           status      TEXT DEFAULT 'active'
         );
@@ -827,10 +827,17 @@ export class AgentSupervisor extends DurableObject<Env> {
       return this.deleteAgent(agentId);
     }
 
-    // ── Chat: forward to agent facet ──
-    if (url.pathname.startsWith("/chat/")) {
+    // ── Chat with a dynamic agent ──
+    if (url.pathname.startsWith("/chat/") && request.method === "POST") {
       const agentId = url.pathname.split("/")[2];
-      return this.forwardToAgent(agentId, request);
+      return this.chatWithAgent(agentId, request);
+    }
+
+    // ── Clear chat history for a dynamic agent ──
+    if (url.pathname.startsWith("/chat/") && request.method === "DELETE") {
+      const agentId = url.pathname.split("/")[2];
+      await this.ctx.storage.put(`chat:${agentId}`, []);
+      return Response.json({ cleared: agentId });
     }
 
     return new Response("Not found", { status: 404 });
@@ -854,29 +861,24 @@ export class AgentSupervisor extends DurableObject<Env> {
     await this.initialize();
 
     const agentId = config.agent_id || crypto.randomUUID().slice(0, 8);
-    const codeId = crypto.randomUUID();
-
-    // Generate the dynamic agent module code
-    const code = this.#generateAgentCode(config);
-
-    // Persist the generated code in storage KV so the facet can load it
-    await this.ctx.storage.put(`code:${agentId}`, code);
 
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO agents
-         (agent_id, name, icon, description, system_prompt, model, enable_sandbox, code_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (agent_id, name, icon, description, system_prompt, model, enable_sandbox)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       agentId,
       config.name || "Custom Agent",
       config.icon || "✦",
       config.description || "",
       config.system_prompt || "You are a helpful assistant.",
       config.model || "@cf/moonshotai/kimi-k2.5",
-      config.enable_sandbox ? 1 : 0,
-      codeId
+      config.enable_sandbox ? 1 : 0
     );
 
-    return Response.json({ agent_id: agentId, code_id: codeId });
+    // Initialize empty chat history
+    await this.ctx.storage.put(`chat:${agentId}`, []);
+
+    return Response.json({ agent_id: agentId });
   }
 
   // ── Soft-delete an agent ───────────────────────────────────────────────────
@@ -889,109 +891,122 @@ export class AgentSupervisor extends DurableObject<Env> {
       agentId
     );
 
-    // Tear down the running facet if one exists
-    try {
-      this.ctx.facets.delete(`agent:${agentId}`);
-    } catch {
-      // Facet may not exist yet; ignore
-    }
+    // Clean up chat history
+    await this.ctx.storage.delete(`chat:${agentId}`);
 
     return Response.json({ deleted: agentId });
   }
 
-  // ── Forward request to agent facet ────────────────────────────────────────
+  // ── Chat with a dynamic agent via Workers AI ──────────────────────────────
+  //
+  // The supervisor handles LLM inference directly. This avoids the complexity
+  // of making dynamic workers work with env bindings.
 
-  async forwardToAgent(agentId: string, request: Request): Promise<Response> {
+  async chatWithAgent(agentId: string, request: Request): Promise<Response> {
     await this.initialize();
 
+    // Look up agent config
     const rows = this.ctx.storage.sql
       .exec(
         "SELECT * FROM agents WHERE agent_id = ? AND status = 'active'",
         agentId
       )
-      .toArray();
+      .toArray() as any[];
 
     if (!rows.length) {
       return Response.json({ error: "Agent not found" }, { status: 404 });
     }
 
-    // Get-or-create the agent facet.
-    // The facet loader runs once; subsequent calls reuse the live instance.
-    const facet = this.ctx.facets.get(`agent:${agentId}`, async () => {
-      const worker = await this.#loadAgentWorker(agentId);
-      const agentClass = worker.getDurableObjectClass("TenantAgent");
-      return { class: agentClass };
-    });
+    const agent = rows[0];
 
-    return facet.fetch(request);
-  }
+    // Parse incoming message
+    let body: { messages?: Array<{ role: string; content: string }> };
+    try {
+      body = (await request.json()) as any;
+    } catch {
+      return Response.json({ error: "Invalid JSON" }, { status: 400 });
+    }
 
-  // ── Load the dynamic worker for an agent ──────────────────────────────────
+    if (!body.messages?.length) {
+      return Response.json({ error: "messages array required" }, { status: 400 });
+    }
 
-  async #loadAgentWorker(agentId: string) {
-    // Retrieve the stored agent code
-    const code = (await this.ctx.storage.get(`code:${agentId}`)) as string;
+    // Load persisted history and append new messages
+    const history =
+      ((await this.ctx.storage.get(`chat:${agentId}`)) as StoredMessage[]) ?? [];
 
-    const rows = this.ctx.storage.sql
-      .exec(
-        "SELECT code_id FROM agents WHERE agent_id = ?",
-        agentId
-      )
-      .toArray() as any[];
+    for (const msg of body.messages) {
+      history.push({ role: msg.role as "user" | "assistant", content: msg.content });
+    }
 
-    // Use agent_id + code_id as a stable cache key for the WorkerLoader
-    const codeId = `${agentId}:${rows[0]?.code_id ?? "default"}`;
+    // Build tool set based on agent config
+    const tools: Record<string, any> = {
+      ...sharedTools(),
+      ...webSearchTools(),
+      ...browserTools(this.env),
+    };
+    if (agent.enable_sandbox) {
+      Object.assign(tools, sandboxTools(this.env));
+    }
 
-    return this.env.LOADER.get(codeId, async () => ({
-      compatibilityDate: "2026-04-01",
-      mainModule: "agent.js",
-      modules: { "agent.js": code },
-      // Facet agents do not get direct internet — all network goes through
-      // the supervisor or is blocked. Set to a gateway binding if needed.
-      globalOutbound: null,
+    // Create Workers AI model
+    const workersai = createWorkersAI({ binding: this.env.AI });
+    const model = workersai(agent.model as Parameters<typeof workersai>[0]);
+
+    // Convert history to model messages format
+    const modelMessages = history.map((m) => ({
+      role: m.role as "user" | "assistant",
+      content: m.content,
     }));
-  }
 
-  // ── Generate the TenantAgent module code ──────────────────────────────────
-  //
-  // The generated code runs inside the facet's isolated V8 context.
-  // It has its own SQLite (ctx.storage) separate from the supervisor's storage.
+    // Limit context window — keep system prompt + last 50 messages
+    const contextMessages = modelMessages.slice(-50);
 
-  #generateAgentCode(config: any): string {
-    // Escape template-literal-breaking characters
-    const systemPrompt = (config.system_prompt || "You are a helpful assistant.")
-      .replace(/\\/g, "\\\\")
-      .replace(/`/g, "\\`")
-      .replace(/\$/g, "\\$");
-    const agentName = (config.name || "Custom Agent")
-      .replace(/\\/g, "\\\\")
-      .replace(/`/g, "\\`");
-
-    return `
-import { DurableObject } from "cloudflare:workers";
-
-export class TenantAgent extends DurableObject {
-  async fetch(request) {
-    // Each facet has its own isolated SQLite — completely separate from the
-    // supervisor DO's storage and from every other facet.
-    let count = (await this.ctx.storage.get("request_count")) || 0;
-    count++;
-    await this.ctx.storage.put("request_count", count);
-
-    const body = await request.json().catch(() => ({}));
-
-    return new Response(JSON.stringify({
-      agent: \`${agentName}\`,
-      system_prompt: \`${systemPrompt}\`,
-      request_count: count,
-      message: body.message || null,
-      note: "This agent runs as a DO Facet with isolated SQLite. Full LLM integration coming in next sprint."
-    }), {
-      headers: { "Content-Type": "application/json" }
+    // Stream the response
+    const result = streamText({
+      model,
+      system: agent.system_prompt as string,
+      messages: contextMessages,
+      tools,
+      toolChoice: "auto",
+      stopWhen: stepCountIs(10),
     });
-  }
-}
-`.trimStart();
+
+    // Collect the full response text for persistence while streaming
+    const self = this;
+    const storageKey = `chat:${agentId}`;
+    const encoder = new TextEncoder();
+
+    // Use the AI SDK's text stream and wrap it to also persist the result
+    const aiStream = result.textStream;
+    let fullResponse = "";
+
+    const outputStream = new ReadableStream({
+      async start(controller) {
+        try {
+          for await (const chunk of aiStream) {
+            fullResponse += chunk;
+            controller.enqueue(encoder.encode(chunk));
+          }
+          // Persist the assistant reply
+          history.push({ role: "assistant", content: fullResponse });
+          // Keep last 200 messages to avoid unbounded storage growth
+          const trimmed = history.slice(-200);
+          await self.ctx.storage.put(storageKey, trimmed);
+          controller.close();
+        } catch (err) {
+          controller.error(err);
+        }
+      },
+    });
+
+    return new Response(outputStream, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Transfer-Encoding": "chunked",
+        "Cache-Control": "no-cache",
+      },
+    });
   }
 }
 

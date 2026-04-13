@@ -41,8 +41,6 @@
     "enabled": true
   },
 
-  // Access code for login protection
-  "vars": {
-    "ACCESS_CODE": "021Agents-ai"
-  }
+  // Access code for login protection — set via: wrangler secret put ACCESS_CODE
+  "vars": {}
 }

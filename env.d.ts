@@ -12,8 +12,6 @@ declare namespace Cloudflare {
 		ChatAgent: DurableObjectNamespace<import("./src/server").ChatAgent>;
 		Sandbox: DurableObjectNamespace<import("./src/server").Sandbox>;
 		AgentSupervisor: DurableObjectNamespace<import("./src/server").AgentSupervisor>;
-		/** WorkerLoader binding — loads dynamic worker code at runtime */
-		LOADER: WorkerLoader;
 		/** Browser Rendering API — headless Puppeteer browser */
 		MYBROWSER: Fetcher;
 		/** Optional API keys injected via outbound Workers — set as secrets */
