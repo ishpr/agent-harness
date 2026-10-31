@@ -87,6 +87,10 @@ npx wrangler deploy --config dist/agent_harness/wrangler.json
 - Vite 8 + `@cloudflare/vite-plugin`
 - TypeScript 6
 
+## Planning
+
+See the [backlog](BACKLOG.md) for deferred implementation plans.
+
 ## License
 
 Private
